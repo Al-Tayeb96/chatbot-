@@ -1,0 +1,125 @@
+import requests
+import logging
+import random
+from datetime import datetime, timedelta
+from typing import Any, Text, Dict, List
+
+from rasa_sdk import Action, Tracker
+from rasa_sdk.executor import CollectingDispatcher
+from rasa_sdk.events import SlotSet
+
+import cx_Oracle
+
+# === إعداد logger ===
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+# === أكشن طلب كشف الحساب وإرسال OTP ===
+class ActionRequestAccountStatementOTP(Action):
+    def name(self) -> Text:
+        return "action_request_account_statement_otp"
+
+    def run(
+        self,
+        dispatcher: CollectingDispatcher,
+        tracker: Tracker,
+        domain: Dict[Text, Any],
+    ) -> List[Dict[Text, Any]]:
+
+        # نحاول أولاً التقاط الرقم من أي slot موجود
+        user_input = tracker.get_slot("customer_num") or tracker.get_slot("customer_id") or tracker.latest_message.get("text")
+        if not user_input:
+            dispatcher.utter_message(text="الرجاء إدخال رقم العميل أو رقم الهوية.")
+            return []
+
+        # === تحديد نوع الرقم ===
+        if len(user_input) == 6:
+            cus_num = user_input
+            nat_num = None
+        elif len(user_input) == 9 or len(user_input) == 10:
+            cus_num = None
+            nat_num = user_input
+        else:
+            dispatcher.utter_message(text="❌ الرقم المدخل غير صحيح. يرجى التحقق من الرقم.")
+            logger.debug(f"Invalid input length: {user_input}")
+            return []
+
+        # === الاتصال بقاعدة البيانات ===
+        try:
+            dsn = cx_Oracle.makedsn("172.28.61.10", 1898, sid="banks.world4")
+            conn = cx_Oracle.connect(user="YOUR_DB_USER", password="Abcd_5321", dsn=dsn)
+            cursor = conn.cursor()
+            logger.debug("Connected to Oracle DB successfully.")
+        except Exception as e:
+            dispatcher.utter_message(text="❌ فشل الاتصال بقاعدة البيانات.")
+            logger.error(f"Database connection error: {e}")
+            return []
+
+        # === استعلام العميل ===
+        query = """
+        SELECT CUSTOMER.BRA_CODE,
+               CUSTOMER.CUS_NUM,
+               CUSTOMER.NAT_NUM,
+               SUBSTR(CUST_PRO.TEL_NUM, 5) AS TEL_NUM,
+               adrs.EMAIL,
+               CUST_PRO.IND_CORP_FLAG
+        FROM BANKSYS.CUSTOMER CUSTOMER,
+             BANKSYS.CUST_PRO CUST_PRO,
+             BANKSYS.ADDRESS adrs
+        WHERE CUSTOMER.BRA_CODE = CUST_PRO.BRA_CODE
+          AND CUSTOMER.CUS_NUM = CUST_PRO.CUS_NUM
+          AND adrs.BRA_CODE = CUST_PRO.BRA_CODE
+          AND adrs.CUS_NUM = CUSTOMER.CUS_NUM
+          AND (CUSTOMER.CUS_NUM = :cus_num OR CUSTOMER.NAT_NUM = :nat_num)
+          AND CUST_PRO.IND_CORP_FLAG = 1
+          AND adrs.LED_CODE = 0
+        """
+        try:
+            cursor.execute(query, cus_num=cus_num, nat_num=nat_num)
+            result = cursor.fetchone()
+            if not result:
+                dispatcher.utter_message(text="❌ لم يتم العثور على العميل.")
+                logger.debug("Customer not found in database.")
+                return []
+            bra_code, cus_num_db, nat_num_db, tel_num, email, ind_corp_flag = result
+            logger.debug(f"Fetched customer data: {result}")
+        except Exception as e:
+            dispatcher.utter_message(text="❌ حدث خطأ أثناء استعلام البيانات.")
+            logger.error(f"Database query error: {e}")
+            return []
+        finally:
+            cursor.close()
+            conn.close()
+            logger.debug("Database connection closed.")
+
+        # === توليد OTP ===
+        otp_code = str(random.randint(1000, 9999))
+        otp_expiry_time = datetime.now() + timedelta(minutes=1)
+        logger.debug(f"Generated OTP: {otp_code}, expires at {otp_expiry_time}")
+
+        # === إرسال OTP عبر API ===
+        sms_api = f"https://sms.tnbank.ps/BANKSSMS/otpservice?user=YOUR_USER&password=YOUR_PASSWORD&mobiles={tel_num}&sms=رمز التحقق الخاص بك هو {otp_code}&senderid="
+        try:
+            response = requests.get(sms_api)
+            if response.status_code == 200:
+                dispatcher.utter_message(text="✅ تم إرسال رمز التحقق إلى هاتفك.")
+                logger.debug(f"OTP sent successfully to {tel_num}. API response: {response.text}")
+            else:
+                dispatcher.utter_message(text="❌ فشل إرسال رمز التحقق. حاول لاحقًا.")
+                logger.error(f"OTP API failed. Status: {response.status_code}, Response: {response.text}")
+                return []
+        except Exception as e:
+            dispatcher.utter_message(text="❌ حدث خطأ أثناء إرسال OTP.")
+            logger.error(f"OTP API request error: {e}")
+            return []
+
+        # === تحديث slots ===
+        return [
+            SlotSet("customer_id", cus_num_db or nat_num_db),
+            SlotSet("customer_num", cus_num_db),
+            SlotSet("customer_mobile", tel_num),
+            SlotSet("customer_email", email),
+            SlotSet("otp", otp_code),
+            SlotSet("otp_expiry", otp_expiry_time.strftime("%Y-%m-%d %H:%M:%S")),
+            SlotSet("otp_sent", True),
+        ]
