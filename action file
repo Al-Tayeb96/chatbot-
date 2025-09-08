@@ -1,0 +1,895 @@
+from typing import Any, Text, Dict, List, Optional
+from rasa_sdk import Action, Tracker
+from rasa_sdk.executor import CollectingDispatcher
+from rasa_sdk.events import FollowupAction
+from rasa_sdk.events import SlotSet
+from langdetect import detect
+from rapidfuzz import fuzz, process
+from .main_menu_ar import main_menu_ar
+from .main_menu_en import main_menu_en
+from .intent_submenu_map import intent_to_submenu_map
+from rasa_sdk.types import DomainDict
+import logging
+import re
+
+logger = logging.getLogger(__name__)
+class ActionDetectLanguage(Action):
+    def name(self) -> Text:
+        return "action_detect_language"
+
+    def run(self, dispatcher: CollectingDispatcher,
+            tracker: Tracker,
+            domain: Dict[Text, Any]) -> List[Dict[Text, Any]]:
+
+        current_lang = tracker.get_slot("language")
+        print(f"[DEBUG] Current language slot: {current_lang}")
+
+        # إذا اللغة معروفة مسبقًا لا تغيرها
+        if current_lang in ["ar", "en"]:
+            print("[DEBUG] Language already set, skipping detection.")
+            return []
+
+        user_message = tracker.latest_message.get("text", "")
+        print(f"[DEBUG] User message: {user_message}")
+
+        try:
+            detected_lang = detect(user_message)
+            print(f"[DEBUG] Detected language: {detected_lang}")
+            lang = "ar" if detected_lang == "ar" else "en"
+        except Exception as e:
+            print(f"[DEBUG] Language detection failed: {e}")
+            lang = "ar"  # fallback
+
+        print(f"[DEBUG] Setting language slot to: {lang}")
+        return [SlotSet("language", lang)]
+
+
+class ActionSwitchLanguage(Action):
+    def name(self) -> Text:
+        return "action_switch_language"
+
+    def run(self, dispatcher: CollectingDispatcher,
+            tracker: Tracker,
+            domain: Dict[Text, Any]) -> List[Dict[Text, Any]]:
+
+        user_text = tracker.latest_message.get("text", "").lower().strip()
+        print(f"[DEBUG] User requested language switch: {user_text}")
+
+        keywords = {
+            "ar": ["عربي", "بالعربية", "عرب", "عربية", "arabic", "arab","AR"],
+            "en": ["english", "إنجليزي", "الإنجليزية", "إنجليزية", "انجليزي","ENG","EN","إنجليش", "انجليز"]
+        }
+
+        new_lang = None
+        if any(k in user_text for k in keywords["ar"]):
+            new_lang = "ar"
+        elif any(k in user_text for k in keywords["en"]):
+            new_lang = "en"
+
+        if not new_lang:
+            msg = "❌ لم يتم التعرف على اللغة المطلوبة." if tracker.get_slot("language") == "ar" \
+                  else "❌ Could not detect the requested language."
+            dispatcher.utter_message(text=msg)
+            print(f"[DEBUG] Language not recognized, message sent: {msg}")
+            return []
+
+        print(f"[DEBUG] Switching language to: {new_lang}")
+
+        # تحميل القائمة الرئيسية باللغة الجديدة
+        main_menu = get_main_menu(tracker, language=new_lang)
+        TITLES, EMOJIS = get_titles_emojis(new_lang)
+        menu_data = list_options("main", main_menu=main_menu, TITLES=TITLES, EMOJIS=EMOJIS, language=new_lang)
+
+        # رسالة تأكيد
+        confirmation_msg = "تم التبديل إلى اللغة العربية ✅" if new_lang == "ar" else "Switched to English ✅"
+        dispatcher.utter_message(text=confirmation_msg)
+        print(f"[DEBUG] Confirmation message sent: {confirmation_msg}")
+
+        # عرض القائمة الرئيسية
+        dispatcher.utter_message(text=menu_data["text"], buttons=menu_data.get("buttons", []))
+        print(f"[DEBUG] Main menu displayed: {menu_data}")
+
+        return [
+            SlotSet("language", new_lang),
+            SlotSet("current_menu", "main"),
+            SlotSet("current_submenu", None),
+            SlotSet("menu_path_history", []),
+            SlotSet("awaiting_confirmation", False)
+        ]
+
+
+
+
+# الأكشنات البسيطة فقط تستدعي الردود من domain حسب لغة المستخدم:
+class ActionGreet(Action):
+    def name(self) -> Text:
+        return "action_greet"
+
+    def run(self, dispatcher: CollectingDispatcher,
+            tracker: Tracker,
+            domain: Dict[Text, Any]) -> List[Dict[Text, Any]]:
+
+        print("[DEBUG] ActionGreet triggered")
+        dispatcher.utter_message(response="utter_greet")
+        return []
+
+
+class ActionGoodbye(Action):
+    def name(self) -> Text:
+        return "action_goodbye"
+
+    def run(self, dispatcher: CollectingDispatcher,
+            tracker: Tracker,
+            domain: Dict[Text, Any]) -> List[Dict[Text, Any]]:
+
+        print("[DEBUG] ActionGoodbye triggered")
+        dispatcher.utter_message(response="utter_goodbye")
+        return []
+
+
+class ActionAskHowAreYou(Action):
+    def name(self) -> Text:
+        return "action_ask_how_are_you"
+
+    def run(self, dispatcher: CollectingDispatcher,
+            tracker: Tracker,
+            domain: Dict[Text, Any]) -> List[Dict[Text, Any]]:
+
+        print("[DEBUG] ActionAskHowAreYou triggered")
+        dispatcher.utter_message(response="utter_ask_how_are_you")
+        return []
+
+
+class ActionBotIdentity(Action):
+    def name(self) -> Text:
+        return "action_bot_identity"
+
+    def run(self, dispatcher: CollectingDispatcher,
+            tracker: Tracker,
+            domain: Dict[Text, Any]) -> List[Dict[Text, Any]]:
+
+        language = tracker.get_slot("language")
+        print(f"[DEBUG] ActionBotIdentity triggered | Current language slot: {language}")
+        dispatcher.utter_message(response="utter_bot_identity")
+        return []
+
+
+class ActionThankYou(Action):
+    def name(self) -> Text:
+        return "action_thank_you"
+
+    def run(self, dispatcher: CollectingDispatcher,
+            tracker: Tracker,
+            domain: Dict[Text, Any]) -> List[Dict[Text, Any]]:
+
+        print("[DEBUG] ActionThankYou triggered")
+        dispatcher.utter_message(response="utter_thank_you")
+        return []
+
+
+# لتحويل الأرقام العربية إلى الغربية إذا احتجت في أي مكان
+ARABIC_TO_WESTERN = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
+# قائمة اللغات المدعومة
+SUPPORTED_LANGUAGES = {"ar", "en"}
+
+# دالة عرض ملف main_menu حسب اللغة
+def get_main_menu(tracker: Tracker, language=None) -> Dict[str, Any]:
+    language = language or tracker.get_slot("language") or "ar"
+    if language not in SUPPORTED_LANGUAGES:
+        print(f"[DEBUG] Unsupported language '{language}', defaulting to Arabic")
+        language = "ar"
+    else:
+        print(f"[DEBUG] Loading main menu for language: {language}")
+
+    if language == "ar":
+        menu = main_menu_ar
+    else:
+        menu = main_menu_en
+
+    print(f"[DEBUG] Main menu loaded: {list(menu.keys())}")
+    return menu
+
+# دالة قائمة الخدمات الرئيسية
+def get_titles_emojis(language: str):
+    print(f"[DEBUG] Getting titles and emojis for language: {language}")
+
+    if language == "en":
+        TITLES = {
+            "1": "Accounts",
+            "2": "Transfers",
+            "3": "Instant Transfers",
+            "4": "Cards",
+            "5": "Facilities",
+            "6": "E-Services",
+            "7": "E-Payments",
+            "8": "Checks",
+            "9": "Branches & ATMs",
+            "10": "Other Services",
+        }
+        EMOJIS = {
+            "1": "📜",
+            "2": "💸",
+            "3": "⚡",
+            "4": "💳",
+            "5": "💼",
+            "6": "🌐",
+            "7": "🖥️",
+            "8": "📝",
+            "9": "🏦",
+            "10": "📌",
+        }
+    else:
+        TITLES = {
+            "1": "الحسابات",
+            "2": "الحوالات",
+            "3": "الحوالات الفورية",
+            "4": "البطاقات",
+            "5": "التسهيلات",
+            "6": "الخدمات الإلكترونية",
+            "7": "السداد الإلكتروني",
+            "8": "الشيكات",
+            "9": "الفروع والصرافات",
+            "10": "خدمات أخرى",
+        }
+        EMOJIS = {
+            "1": "📜",
+            "2": "💸",
+            "3": "⚡",
+            "4": "💳",
+            "5": "💼",
+            "6": "🌐",
+            "7": "🖥️",
+            "8": "📝",
+            "9": "🏦",
+            "10": "📌",
+        }
+
+    print(f"[DEBUG] TITLES: {TITLES}")
+    print(f"[DEBUG] EMOJIS: {EMOJIS}")
+    return TITLES, EMOJIS
+def list_options(
+    menu_key: Optional[str] = None,
+    main_menu: Optional[Dict[str, Any]] = None,
+    TITLES: Optional[Dict[str, str]] = None,
+    EMOJIS: Optional[Dict[str, str]] = None,
+    submenu: Optional[List[Dict[str, Any]]] = None,
+    language: str = "ar"
+) -> Dict[str, Any]:
+
+    is_ar = language == "ar"
+    if TITLES is None or EMOJIS is None:
+        TITLES, EMOJIS = get_titles_emojis(language)
+
+    print(f"[DEBUG] list_options called | language: {language}, menu_key: {menu_key}, submenu: {bool(submenu)}")
+
+    def resolve_service_title() -> str:
+        if menu_key:
+            service_title = TITLES.get(str(menu_key))
+            if service_title:
+                return service_title
+            if main_menu and menu_key in main_menu:
+                title_dict = main_menu[menu_key].get("title")
+                if isinstance(title_dict, dict):
+                    return title_dict.get(language, str(menu_key))
+                elif isinstance(title_dict, str):
+                    return title_dict
+            return str(menu_key)
+        return ""
+
+    # قائمة فرعية محددة
+    if submenu is not None:
+        service_title = resolve_service_title()
+        print(f"[DEBUG] Submenu detected | service_title: {service_title} | options_count: {len(submenu)}")
+        lines = [
+            f"🕽️ الخيارات المتاحة لخدمة :" if is_ar else f"🕽️ Available options for service :"
+        ]
+        for i, item in enumerate(submenu, 1):
+            title = item.get("title") or item.get("text") or f"Option {i}"
+            if isinstance(title, dict):
+                title = title.get(language, f"Option {i}")
+            else:
+                title = str(title)
+            lines.append(f"{i}. {title}")
+        back_title = "0. رجوع 🔙" if is_ar else "0. Back 🔙"
+        return {"text": "\n".join(lines), "buttons": [{"title": back_title, "payload": "0"}]}
+
+    # القائمة الرئيسية
+    if menu_key == "main" or menu_key is None:
+        print("[DEBUG] Displaying main menu")
+        lines = ["📋 القائمة الرئيسية للخدمات البنكية:" if is_ar else "📋 Main banking services menu:"]
+        for k, v in TITLES.items():
+            emoji = EMOJIS.get(k, "")
+            lines.append(f"{k}. {v} {emoji}")
+        lines.append("يرجى اختيار رقم الخدمة أو اسمها." if is_ar else "Please choose the number or name of the service.")
+        return {"text": "\n".join(lines), "buttons": []}
+
+    # قائمة فرعية من main_menu[menu_key]
+    menu = main_menu.get(menu_key, {})
+    title_dict = menu.get("title", "")
+    if isinstance(title_dict, dict):
+        title = title_dict.get(language, "")
+    else:
+        title = str(title_dict)
+
+    options = menu.get("options", {})
+    print(f"[DEBUG] Displaying submenu | title: {title} | options_count: {len(options)}")
+    lines = [f"📋 {title}:"]
+    for k, opt in options.items():
+        text_dict = opt.get("text", "")
+        if isinstance(text_dict, dict):
+            text = text_dict.get(language, "")
+        else:
+            text = str(text_dict)
+        lines.append(f"{k}. {text}")
+
+    back_title = "0. رجوع 🔙" if is_ar else "0. Back 🔙"
+    return {"text": "\n".join(lines), "buttons": [{"title": back_title, "payload": "0"}]}
+
+def normalize_arabic(text: str) -> str:
+    text = text.strip().lower()
+    text = text.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
+    text = re.sub(r"[\u0617-\u061A\u064B-\u0652]", "", text)  # تشكيل
+    text = re.sub(r"[^\w\s]", "", text)  # رموز
+    text = text.replace("ى", "ي")
+    return text
+
+
+
+
+def search_all_levels(user_message: str, menu: Dict[str, Any], threshold: int = 75) -> Optional[Dict[str, Any]]:
+    user_message_norm = normalize_arabic(user_message)
+    print(f"[DEBUG] Normalized user message: {user_message_norm}")
+    best_match = None
+    best_score = 0
+
+    def recursive_search(options: Dict[str, Any], level=0):
+        nonlocal best_match, best_score
+        for key, item in options.items():
+            if not isinstance(item, dict):
+                continue
+            for candidate in (item.get("title", ""), item.get("text", "")):
+                candidate_norm = normalize_arabic(candidate)
+                score = fuzz.token_set_ratio(user_message_norm, candidate_norm)
+                print(f"{'  '*level}[DEBUG] Checking candidate: '{candidate_norm}' | score: {score}")
+                if score > best_score and score >= threshold:
+                    best_match = item
+                    best_score = score
+            if "submenu" in item and isinstance(item["submenu"], list):
+                recursive_search({str(i): v for i, v in enumerate(item["submenu"])}, level+1)
+            if "options" in item and isinstance(item["options"], dict):
+                recursive_search(item["options"], level+1)
+
+    recursive_search(menu)
+    print(f"[DEBUG] Best match: {best_match} | Score: {best_score}")
+    return best_match
+
+
+def get_node_by_path(menu: Dict[str, Any], path: List[Any]) -> Optional[Dict[str, Any]]:
+    node = menu
+    for i, step in enumerate(path):
+        print(f"[DEBUG] Step {i}: {step} | Current node type: {type(node).__name__}")
+        if node is None:
+            return None
+        if isinstance(step, str):
+            node = node.get(step) if step != "submenu" else node.get("submenu", [])
+        elif isinstance(step, int):
+            if isinstance(node, list) and 0 <= step < len(node):
+                node = node[step]
+            else:
+                print(f"[DEBUG] Invalid index {step} for node {node}")
+                return None
+        else:
+            print(f"[DEBUG] Invalid step type: {type(step).__name__}")
+            return None
+    print(f"[DEBUG] Node found at path: {node}")
+    return node
+
+class ActionOpenMenu(Action):
+    def name(self) -> Text:
+        return "action_open_menu"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: Dict[Text, Any]) -> List[Dict[Text, Any]]:
+        language = tracker.get_slot("language") or "ar"
+        main_menu = get_main_menu(tracker)  # ترجع القائمة حسب اللغة
+        TITLES, EMOJIS = get_titles_emojis(language)
+
+        menu_data = list_options("main", main_menu=main_menu, TITLES=TITLES, EMOJIS=EMOJIS, language=language)
+        dispatcher.utter_message(text=menu_data["text"], buttons=menu_data.get("buttons", []))
+
+        return [
+            SlotSet("current_menu", "main"),
+            SlotSet("current_submenu", None),
+            SlotSet("current_menu_section", None),
+            SlotSet("menu_path_history", []),
+            SlotSet("awaiting_confirmation", False,50)
+        ]
+
+class ActionHandleMenuOption(Action):
+    def name(self) -> Text:
+        return "action_handle_menu_option"
+
+    # دالة لتحويل النصوص التي تعبر عن أرقام من 1 إلى 10 (عربية وإنجليزية) إلى رقم صحيح
+    def normalize_text_number(self, text: str) -> Optional[int]:
+        ARABIC_NUMBER_MAP = {
+            # كلمات عربية للأرقام
+            "واحد": 1, "اول": 1, "الأول": 1, "الأولى": 1, "اﻷول": 1,
+            "اثنان": 2, "اثنين": 2, "اتنين": 2, "ثاني": 2, "ثانية": 2, "الثانية": 2, "الثاني": 2,
+            "ثلاثة": 3, "ثالث": 3, "الثالث": 3, "ثالثة": 3, "الثالثة": 3,
+            "أربعة": 4, "رابع": 4, "الرابع": 4, "رابعة": 4, "الرابعة": 4,
+            "خمسة": 5, "خامس": 5, "الخامس": 5, "خامسة": 5, "الخامسة": 5,
+            "ستة": 6, "سادس": 6, "السادس": 6, "سادسة": 6, "السادسة": 6,
+            "سبعة": 7, "سابع": 7, "السابع": 7, "سابعة": 7, "السابعة": 7,
+            "ثمانية": 8, "ثامن": 8, "الثامن": 8, "ثامنة": 8, "الثامنة": 8,
+            "تسعة": 9, "تاسع": 9, "التاسع": 9, "تاسعة": 9, "التاسعة": 9,
+            "عشرة": 10, "عاشر": 10, "العاشر": 10, "عاشرة": 10, "العاشرة": 10,
+
+            # الأرقام الهندية (أرقام عربية شرقية)
+            "٠": 0,
+            "١": 1,
+            "٢": 2,
+            "٣": 3,
+            "٤": 4,
+            "٥": 5,
+            "٦": 6,
+            "٧": 7,
+            "٨": 8,
+            "٩": 9
+        }
+
+        ENGLISH_NUMBER_MAP = {
+            "one": 1, "first": 1,
+            "two": 2, "second": 2,
+            "three": 3, "third": 3,
+            "four": 4, "fourth": 4,
+            "five": 5, "fifth": 5,
+            "six": 6, "sixth": 6,
+            "seven": 7, "seventh": 7,
+            "eight": 8, "eighth": 8,
+            "nine": 9, "ninth": 9,
+            "ten": 10, "tenth": 10,
+        }
+
+        text = text.lower().strip()
+        print(f"DEBUG normalize_text_number called with text='{text}'")
+
+        # 1. محاولة التقاط رقم مباشر
+        match = re.search(r"\b\d+\b", text)
+        if match:
+            num = int(match.group())
+            print(f"DEBUG Direct number detected: {num}")
+            if 1 <= num <= 10:
+                return num
+
+        # 2. محاولة مطابقة غامضة مع الكلمات العربية
+        best_match_ar = process.extractOne(text, ARABIC_NUMBER_MAP.keys(), scorer=fuzz.partial_ratio)
+        print(f"DEBUG Arabic fuzzy match: {best_match_ar}")
+        if best_match_ar and best_match_ar[1] >= 85:
+            return ARABIC_NUMBER_MAP[best_match_ar[0]]
+
+        # 3. محاولة مطابقة غامضة مع الكلمات الإنجليزية
+        best_match_en = process.extractOne(text, ENGLISH_NUMBER_MAP.keys(), scorer=fuzz.partial_ratio)
+        print(f"DEBUG English fuzzy match: {best_match_en}")
+        if best_match_en and best_match_en[1] >= 85:
+            return ENGLISH_NUMBER_MAP[best_match_en[0]]
+
+        print("DEBUG No valid number match found")
+        return None
+
+    # دالة للبحث داخل القائمة بناءً على مسار
+    def _get_option_by_path(self, menu: Dict[str, Any], path: List[Any]) -> Optional[Dict[str, Any]]:
+        print(f"DEBUG _get_option_by_path called with path={path}")
+        node = menu.get(path[0])
+        for step in path[1:]:
+            print(f"DEBUG Traversing step={step}, current_node={node}")
+            if node is None:
+                print("DEBUG Node is None → returning None")
+                return None
+            if isinstance(step, str):
+                if isinstance(node, dict):
+                    node = node.get(step)
+                    print(f"DEBUG Step is str, moved to node={node}")
+                else:
+                    print("DEBUG Step is str but node not dict → returning None")
+                    return None
+            elif isinstance(step, int):
+                if isinstance(node, list) and 0 <= step < len(node):
+                    node = node[step]
+                    print(f"DEBUG Step is int, moved to node={node}")
+                else:
+                    print("DEBUG Step is int but invalid index/list → returning None")
+                    return None
+            else:
+                print("DEBUG Step type not supported → returning None")
+                return None
+        print(f"DEBUG Final node={node}")
+        return node
+
+
+    # دالة للتعامل مع الخيار المختار (عرض نص، روابط، فيديو، إلخ)
+    def _handle_leaf_option(
+            self,
+            dispatcher: CollectingDispatcher,
+            tracker: Tracker,
+            option: Dict[str, Any],
+            language: str,
+            path_history: List[str],
+            option_key: Optional[str] = None
+    ) -> List[Dict[Text, Any]]:
+        title = option.get("text") or option.get("title") or ("الخدمة" if language == "ar" else "Service")
+        updated_history = path_history.copy()
+        if option_key:
+            updated_history.append(option_key)
+
+        # أوامر خاصة (رجوع للقائمة الرئيسية أو السابقة)
+        if option.get("action") in {"back_to_main", "back"}:
+            if option["action"] == "back_to_main":
+                TITLES, EMOJIS = get_titles_emojis(language)
+                main_menu = get_main_menu(tracker)
+                menu_data = list_options("main", main_menu=main_menu, TITLES=TITLES, EMOJIS=EMOJIS, language=language)
+                dispatcher.utter_message(text=menu_data["text"], buttons=menu_data.get("buttons", []))
+                return [
+                    SlotSet("current_menu", "main"),
+                    SlotSet("current_submenu", None),
+                    SlotSet("menu_path_history", []),
+                    SlotSet("awaiting_confirmation", False)
+                ]
+            else:
+                return [FollowupAction("action_back")]
+
+        # قائمة فرعية
+        if "submenu" in option and option["submenu"]:
+            service_title = option_key or option.get("title") or option.get("text") or (
+                "الخدمة" if language == "ar" else "Service")
+            submenu_data = list_options(
+                submenu=option["submenu"],
+                language=language,
+                menu_key=service_title
+            )
+            dispatcher.utter_message(text=submenu_data["text"], buttons=submenu_data.get("buttons", []))
+            return [
+                SlotSet("current_submenu", option["submenu"]),
+                SlotSet("current_menu_section", service_title),
+                SlotSet("menu_path_history", path_history + [service_title])
+            ]
+
+        # قائمة خيارات فرعية
+        if "options" in option and isinstance(option["options"], dict):
+            submenu_list = list(option["options"].values())
+            submenu_data = list_options(
+                submenu=submenu_list,
+                language=language,
+                menu_key=option_key
+            )
+            dispatcher.utter_message(text=submenu_data["text"], buttons=submenu_data.get("buttons", []))
+            return [
+                SlotSet("current_submenu", submenu_list),
+                SlotSet("menu_path_history", updated_history)
+            ]
+
+        # روابط، فيديوهات، معلومات نصية أو أفعال نهائية
+        if any(key in option for key in ("link", "youtube", "text_info", "action")):
+            if "link" in option:
+                dispatcher.utter_message(
+                    text=(f"🔗 للحصول على خدمة {title}، يرجى الضغط على الزر أدناه:" if language == "ar"
+                          else f"🔗 To access {title} service, please click the button below:"),
+                    buttons=[
+                        {"title": (f"فتح رابط {title}" if language == "ar" else f"Open {title} link"),
+                         "url": option["link"], "type": "web_url"},
+                        {"title": "0. رجوع 🔙" if language == "ar" else "0. Back 🔙", "payload": "0"},
+                    ],
+                )
+            elif "youtube" in option:
+                dispatcher.utter_message(
+                    text=(f"🎥 لمشاهدة فيديو حول خدمة {title}، يرجى الضغط على الزر أدناه:" if language == "ar"
+                          else f"🎥 To watch a video about {title}, please click the button below:"),
+                    buttons=[
+                        {"title": (f"مشاهدة {title}" if language == "ar" else f"Watch {title}"),
+                         "url": option["youtube"], "type": "web_url"},
+                        {"title": "0. رجوع 🔙" if language == "ar" else "0. Back 🔙", "payload": "0"},
+                    ],
+                )
+            elif "text_info" in option:
+                buttons = option.get("buttons") or []
+                buttons.append({"title": "0. رجوع 🔙" if language == "ar" else "0. Back 🔙", "payload": "0"})
+                dispatcher.utter_message(
+                    text=option["text_info"],
+                    buttons=buttons
+                )
+            elif "action" in option:
+                action_name = option["action"]
+                # إذا كان اسم الاكشن Rasa Action
+                if action_name.startswith("action_") or action_name.startswith("request_"):
+                    return [FollowupAction(action_name)]
+                else:
+                    dispatcher.utter_message(
+                        text=action_name,
+                        buttons=[
+                            {"title": "0. رجوع 🔙" if language == "ar" else "0. Back 🔙", "payload": "0"}
+                        ],
+                    )
+
+            dispatcher.utter_message(response="utter_ask_more_help")
+            return [
+                SlotSet("current_submenu", tracker.get_slot("current_submenu")),
+                SlotSet("menu_path_history", updated_history),
+                SlotSet("awaiting_confirmation", True, 50)
+            ]
+
+        # لا توجد معلومات متاحة
+        dispatcher.utter_message(
+            text=(f"❌ لا توجد معلومات متاحة لخدمة {title}." if language == "ar"
+                  else f"❌ No information available for {title}."),
+            buttons=[{"title": "0. رجوع 🔙" if language == "ar" else "0. Back 🔙", "payload": "0"}],
+        )
+        dispatcher.utter_message(response="utter_ask_more_help")
+        return [
+            SlotSet("current_submenu", None),
+            SlotSet("menu_path_history", updated_history),
+            SlotSet("awaiting_confirmation", True, 50)
+        ]
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: Dict[Text, Any]) -> List[Dict[Text, Any]]:
+        language = tracker.get_slot("language") or "ar"
+        main_menu = get_main_menu(tracker)
+        TITLES, EMOJIS = get_titles_emojis(language)
+
+        user_message = tracker.latest_message.get("text", "").strip()
+        user_intent = tracker.latest_message.get("intent", {}).get("name")
+
+        current_menu = tracker.get_slot("current_menu") or "main"
+        current_submenu = tracker.get_slot("current_submenu")
+        current_menu_section = tracker.get_slot("current_menu_section")  # <-- إضافة استرجاع slot اسم القسم الفرعي
+        path_history = tracker.get_slot("menu_path_history") or []
+
+        # جلب كيان option إذا وجد
+        option_entity = next(tracker.get_latest_entity_values("option"), None)
+        normalized_option = self.normalize_text_number(option_entity or user_message)
+
+        # التعامل مع الانتقالات المخصصة عبر النوايا
+        if user_intent in intent_to_submenu_map:
+            submenu_info = intent_to_submenu_map[user_intent]
+            menu_key = submenu_info["menu_key"]
+            path = submenu_info.get("path", [])
+            menu_section = main_menu.get(menu_key, {})
+
+            # جلب الخيار باستخدام المسار الكامل
+            option = self._get_option_by_path(menu_section, path) if path else menu_section
+
+            if option:
+                if menu_key not in path_history:
+                    path_history.append(menu_key)
+                # عرض الخدمة أو القائمة الفرعية مباشرة
+                return self._handle_leaf_option(dispatcher, tracker, option, language, path_history,
+                                                option_key=path[-1] if path else menu_key)
+
+        # أمر الرجوع
+        if user_message == "٠"or user_message == "0":
+            return ActionBack().run(dispatcher, tracker, domain)
+
+        print(f"DEBUG current_submenu: {current_submenu}")
+        print(f"DEBUG current_menu_section: {current_menu_section}")
+        print(f"DEBUG option_entity: {option_entity}")
+        print(f"DEBUG user_message: '{user_message}'")
+        print(f"DEBUG normalized_option: {normalized_option}")
+
+        # إذا لم يوجد current_submenu لكن يوجد current_menu_section، نعيد بناء current_submenu من main_menu
+        if not current_submenu and current_menu_section:
+            section = main_menu.get(current_menu_section)
+            if section and "submenu" in section:
+                current_submenu = section["submenu"]
+                print(
+                    f"DEBUG Rebuilt current_submenu from current_menu_section '{current_menu_section}' with {len(current_submenu)} options.")
+
+        # التعامل مع القائمة الفرعية الحالية (إن وجدت)
+        if current_submenu:
+            if normalized_option and 1 <= normalized_option <= len(current_submenu):
+                item = current_submenu[normalized_option - 1]
+                return self._handle_leaf_option(dispatcher, tracker, item, language, path_history)
+            print(f"DEBUG: Current submenu detected with {len(current_submenu)} options.")
+            for idx, item in enumerate(current_submenu, 1):
+                title = item.get("title") or item.get("text")
+                if isinstance(title, dict):
+                    title = title.get(language, "")
+                if user_message == str(idx):
+                    return self._handle_leaf_option(dispatcher, tracker, item, language, path_history)
+                if fuzz.token_set_ratio(user_message.lower(), title.lower()) >= 75:
+                    return self._handle_leaf_option(dispatcher, tracker, item, language, path_history)
+
+        # التعامل مع القائمة الرئيسية إذا لم تكن هناك قائمة فرعية
+        if current_menu == "main" and not current_submenu:
+            options = main_menu
+
+            # إذا تم التعرف على رقم خيار صحيح
+            if normalized_option and 1 <= normalized_option <= len(options):
+                option_items = list(options.items())
+                selected_key, selected_option = option_items[normalized_option - 1]
+                # مهم: هنا يجب حفظ current_menu_section عند الدخول لقائمة فرعية جديدة
+                return self._handle_leaf_option(dispatcher, tracker, selected_option, language, path_history,
+                                                option_key=selected_key)
+
+            # إذا كانت الرسالة رقمية مباشرة
+            if user_message.isdigit():
+                index = int(user_message)
+                option_items = list(options.items())
+                if 1 <= index <= len(option_items):
+                    selected_key, selected_option = option_items[index - 1]
+                    # حفظ current_menu_section عند الدخول لقائمة فرعية
+                    return self._handle_leaf_option(dispatcher, tracker, selected_option, language, path_history,
+                                                    option_key=selected_key)
+
+            # تحقق التطابق بناءً على النية أو النص
+            for key, opt in options.items():
+                opt_intent = opt.get("intent")
+                opt_text = opt.get("title", {})
+                text_value = opt_text.get(language, "") if isinstance(opt_text, dict) else opt_text
+                if opt_intent and user_intent == opt_intent:
+                    return self._handle_leaf_option(dispatcher, tracker, opt, language, path_history, option_key=key)
+                if fuzz.token_set_ratio(user_message.lower(), text_value.lower()) >= 75:
+                    return self._handle_leaf_option(dispatcher, tracker, opt, language, path_history, option_key=key)
+
+            # تحقق إضافي للنصوص في حقل "text"
+            for key, opt in options.items():
+                opt_text = opt.get("text", {})
+                text_value = opt_text.get(language, "") if isinstance(opt_text, dict) else opt_text
+                if fuzz.token_set_ratio(user_message.lower(), text_value.lower()) >= 75:
+                    return self._handle_leaf_option(dispatcher, tracker, opt, language, path_history, option_key=key)
+
+        # منع البحث العميق في القوائم الفرعية لتفادي الخلط
+        # بحث عميق فقط من القائمة الرئيسية إذا لم تكن هناك قائمة فرعية
+        if not current_submenu and current_menu == "main":
+            deep_option = search_all_levels(user_message, main_menu)
+            if deep_option:
+                return self._handle_leaf_option(dispatcher, tracker, deep_option, language, path_history)
+
+        # لم يتم التعرف على خيار صحيح، إعادة عرض القائمة مع رسالة خطأ
+        menu_data = list_options(current_menu, main_menu=main_menu, TITLES=TITLES, EMOJIS=EMOJIS, language=language)
+        dispatcher.utter_message(response="utter_invalid_option")
+        dispatcher.utter_message(text=menu_data["text"], buttons=menu_data.get("buttons", []))
+        return [
+            SlotSet("current_menu", "main"),
+            SlotSet("current_submenu", None),
+            SlotSet("menu_path_history", []),
+            SlotSet("awaiting_confirmation", False)
+        ]
+
+
+class ActionBack(Action):
+    def name(self) -> Text:
+        return "action_back"
+
+    def run(
+        self,
+        dispatcher: CollectingDispatcher,
+        tracker: Tracker,
+        domain: DomainDict
+    ) -> List[Dict[Text, Any]]:
+
+        language = tracker.get_slot("language") or "ar"
+        main_menu = get_main_menu(tracker)
+        TITLES, EMOJIS = get_titles_emojis(language)
+        path_history = tracker.get_slot("menu_path_history") or []
+
+        print(f"DEBUG path_history: {path_history}")
+        print(f"DEBUG current language: {language}")
+
+        # 🟨 الحالة 1: الرجوع خطوة للخلف إذا وُجد أكثر من عنصر
+        if len(path_history) > 1:
+            updated_path = path_history[:-1]  # نأخذ نسخة دون تعديل الأصل
+            print(f"DEBUG updated_path for back: {updated_path}")
+
+            try:
+                node = main_menu
+                for step in updated_path:
+                    node = node.get(step, {})
+                    print(f"DEBUG traversing node: {step} -> {node}")
+                    if not isinstance(node, dict):
+                        raise ValueError("Invalid path in menu")
+
+                # استخراج القائمة الفرعية من العقدة الحالية
+                submenu = []
+                if "submenu" in node and isinstance(node["submenu"], list):
+                    submenu = node["submenu"]
+                elif "options" in node and isinstance(node["options"], dict):
+                    submenu = list(node["options"].values())
+
+                print(f"DEBUG submenu after back: {submenu}")
+
+                if submenu:
+                    submenu_data = list_options(
+                        submenu=submenu,
+                        language=language,
+                        menu_key=updated_path[-1] if updated_path else None
+                    )
+                    dispatcher.utter_message(
+                        text="↩️ تم الرجوع إلى القائمة السابقة:" if language == "ar"
+                        else "↩️ Returned to the previous menu:",
+                        buttons=submenu_data.get("buttons", [])
+                    )
+                    dispatcher.utter_message(text=submenu_data["text"])
+
+                    return [
+                        SlotSet("current_submenu", submenu),
+                        SlotSet("current_menu_section", updated_path[-1] if updated_path else None),
+                        SlotSet("menu_path_history", updated_path),
+                        SlotSet("awaiting_confirmation", False, 50)
+                    ]
+                else:
+                    menu_data = list_options(
+                        "main", main_menu=main_menu,
+                        TITLES=TITLES, EMOJIS=EMOJIS, language=language
+                    )
+                    dispatcher.utter_message(text=menu_data["text"], buttons=menu_data.get("buttons", []))
+                    print("DEBUG no submenu found, returning to main menu")
+                    return [
+                        SlotSet("current_menu", "main"),
+                        SlotSet("current_submenu", None),
+                        SlotSet("current_menu_section", None),
+                        SlotSet("menu_path_history", []),
+                        SlotSet("awaiting_confirmation", False, 50)
+                    ]
+
+            except Exception as e:
+                print(f"DEBUG Exception in ActionBack: {e}")
+                dispatcher.utter_message(
+                    text="⚠️ حدث خطأ أثناء الرجوع. يرجى المحاولة من جديد." if language == "ar"
+                    else "⚠️ An error occurred while going back. Please try again."
+                )
+                return []
+
+        # 🟩 الحالة 2: يوجد خطوة واحدة → العودة إلى القائمة الرئيسية
+        elif len(path_history) == 1:
+            menu_data = list_options(
+                "main", main_menu=main_menu,
+                TITLES=TITLES, EMOJIS=EMOJIS, language=language
+            )
+            dispatcher.utter_message(
+                text="🔙 عدت إلى القائمة الرئيسية:" if language == "ar"
+                else "🔙 Returned to the main menu:",
+                buttons=menu_data.get("buttons", [])
+            )
+            dispatcher.utter_message(text=menu_data["text"])
+            print("DEBUG returning to main menu from single path element")
+            return [
+                SlotSet("current_menu", "main"),
+                SlotSet("current_submenu", None),
+                SlotSet("current_menu_section", None),
+                SlotSet("menu_path_history", []),
+                SlotSet("awaiting_confirmation", False, 50)
+            ]
+
+        # 🟥 الحالة 3: لا يوجد أي مسار → لا يمكن الرجوع
+        else:
+            print("DEBUG already at main menu, cannot go back")
+            dispatcher.utter_message(
+                response="utter_already_main_menu"
+            )
+            return []
+
+
+
+
+class ActionDefaultFallback(Action):
+    def name(self) -> Text:
+        return "action_default_fallback"
+
+    def run(self, dispatcher: CollectingDispatcher,
+            tracker: Tracker,
+            domain: Dict[Text, Any]) -> List[Dict[Text, Any]]:
+
+        language = tracker.get_slot("language") or "ar"
+        user_message = tracker.latest_message.get("text", "")
+        user_intent = tracker.latest_message.get("intent", {}).get("name")
+
+        # Debug information
+        print(f"DEBUG ActionDefaultFallback triggered")
+        print(f"DEBUG user_message: '{user_message}'")
+        print(f"DEBUG detected_intent: '{user_intent}'")
+        print(f"DEBUG language: '{language}'")
+
+        if language == "ar":
+            dispatcher.utter_message(text="❓ عذرًا، لم أفهم طلبك. هل يمكنك إعادة صياغته؟")
+        else:
+            dispatcher.utter_message(text="❓ Sorry, I didn't understand that. Can you rephrase it?")
+
+        return []
