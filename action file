@@ -2,7 +2,6 @@ from typing import Any, Text, Dict, List, Optional
 from rasa_sdk import Action, Tracker
 from rasa_sdk.executor import CollectingDispatcher
 from rasa_sdk.events import FollowupAction
-from rasa_sdk.events import SlotSet
 from langdetect import detect
 from rapidfuzz import fuzz, process
 from .main_menu_ar import main_menu_ar
@@ -11,6 +10,8 @@ from .intent_submenu_map import intent_to_submenu_map
 from rasa_sdk.types import DomainDict
 import logging
 import re
+
+
 
 logger = logging.getLogger(__name__)
 class ActionDetectLanguage(Action):
@@ -598,16 +599,7 @@ class ActionHandleMenuOption(Action):
                 )
             elif "action" in option:
                 action_name = option["action"]
-                # إذا كان اسم الاكشن Rasa Action
-                if action_name.startswith("action_") or action_name.startswith("request_"):
-                    return [FollowupAction(action_name)]
-                else:
-                    dispatcher.utter_message(
-                        text=action_name,
-                        buttons=[
-                            {"title": "0. رجوع 🔙" if language == "ar" else "0. Back 🔙", "payload": "0"}
-                        ],
-                    )
+                return [FollowupAction(action_name)]
 
             dispatcher.utter_message(response="utter_ask_more_help")
             return [
@@ -639,12 +631,25 @@ class ActionHandleMenuOption(Action):
 
         current_menu = tracker.get_slot("current_menu") or "main"
         current_submenu = tracker.get_slot("current_submenu")
-        current_menu_section = tracker.get_slot("current_menu_section")  # <-- إضافة استرجاع slot اسم القسم الفرعي
+        current_menu_section = tracker.get_slot("current_menu_section")
         path_history = tracker.get_slot("menu_path_history") or []
+
+        # ------------------- التعديل الجديد: التعامل مع رقم العميل مباشرة -------------------
+        if tracker.get_slot("awaiting_customer_number"):
+            if user_message.isdigit() and 5 <= len(user_message) <= 20:
+                return [FollowupAction("action_request_account_statement_otp")]
+            else:
+                dispatcher.utter_message(text="⚠️ الرجاء إدخال رقم العميل أو رقم الهوية للمتابعة.")
+                return []
+        # -------------------------------------------------------------------------
 
         # جلب كيان option إذا وجد
         option_entity = next(tracker.get_latest_entity_values("option"), None)
         normalized_option = self.normalize_text_number(option_entity or user_message)
+
+        if user_message.isdigit() and (5 <= len(user_message) <= 20):
+            # مباشرة تحويلها لكشف الحساب
+            return [FollowupAction("action_request_account_statement_otp")]
 
         # التعامل مع الانتقالات المخصصة عبر النوايا
         if user_intent in intent_to_submenu_map:
@@ -659,27 +664,35 @@ class ActionHandleMenuOption(Action):
             if option:
                 if menu_key not in path_history:
                     path_history.append(menu_key)
+                # إذا كان الخيار هو كشف الحساب، نفعّل انتظار رقم العميل
+                if option.get("intent") == "open_accounts_statement":
+                    return [
+                        SlotSet("awaiting_customer_number", True),
+                        FollowupAction("action_handle_menu_option")
+                    ]
                 # عرض الخدمة أو القائمة الفرعية مباشرة
                 return self._handle_leaf_option(dispatcher, tracker, option, language, path_history,
                                                 option_key=path[-1] if path else menu_key)
 
         # أمر الرجوع
-        if user_message == "٠"or user_message == "0":
+        if user_message == "٠" or user_message == "0":
             return ActionBack().run(dispatcher, tracker, domain)
 
+        # DEBUG
         print(f"DEBUG current_submenu: {current_submenu}")
         print(f"DEBUG current_menu_section: {current_menu_section}")
         print(f"DEBUG option_entity: {option_entity}")
         print(f"DEBUG user_message: '{user_message}'")
         print(f"DEBUG normalized_option: {normalized_option}")
 
-        # إذا لم يوجد current_submenu لكن يوجد current_menu_section، نعيد بناء current_submenu من main_menu
+        # إعادة بناء current_submenu من current_menu_section إذا موجود
         if not current_submenu and current_menu_section:
             section = main_menu.get(current_menu_section)
             if section and "submenu" in section:
                 current_submenu = section["submenu"]
                 print(
-                    f"DEBUG Rebuilt current_submenu from current_menu_section '{current_menu_section}' with {len(current_submenu)} options.")
+                    f"DEBUG Rebuilt current_submenu from current_menu_section '{current_menu_section}' with {len(current_submenu)} options."
+                )
 
         # التعامل مع القائمة الفرعية الحالية (إن وجدت)
         if current_submenu:
@@ -700,21 +713,17 @@ class ActionHandleMenuOption(Action):
         if current_menu == "main" and not current_submenu:
             options = main_menu
 
-            # إذا تم التعرف على رقم خيار صحيح
             if normalized_option and 1 <= normalized_option <= len(options):
                 option_items = list(options.items())
                 selected_key, selected_option = option_items[normalized_option - 1]
-                # مهم: هنا يجب حفظ current_menu_section عند الدخول لقائمة فرعية جديدة
                 return self._handle_leaf_option(dispatcher, tracker, selected_option, language, path_history,
                                                 option_key=selected_key)
 
-            # إذا كانت الرسالة رقمية مباشرة
             if user_message.isdigit():
                 index = int(user_message)
                 option_items = list(options.items())
                 if 1 <= index <= len(option_items):
                     selected_key, selected_option = option_items[index - 1]
-                    # حفظ current_menu_section عند الدخول لقائمة فرعية
                     return self._handle_leaf_option(dispatcher, tracker, selected_option, language, path_history,
                                                     option_key=selected_key)
 
@@ -735,14 +744,13 @@ class ActionHandleMenuOption(Action):
                 if fuzz.token_set_ratio(user_message.lower(), text_value.lower()) >= 75:
                     return self._handle_leaf_option(dispatcher, tracker, opt, language, path_history, option_key=key)
 
-        # منع البحث العميق في القوائم الفرعية لتفادي الخلط
-        # بحث عميق فقط من القائمة الرئيسية إذا لم تكن هناك قائمة فرعية
+        # البحث العميق من القائمة الرئيسية فقط
         if not current_submenu and current_menu == "main":
             deep_option = search_all_levels(user_message, main_menu)
             if deep_option:
                 return self._handle_leaf_option(dispatcher, tracker, deep_option, language, path_history)
 
-        # لم يتم التعرف على خيار صحيح، إعادة عرض القائمة مع رسالة خطأ
+        # لم يتم التعرف على خيار صحيح
         menu_data = list_options(current_menu, main_menu=main_menu, TITLES=TITLES, EMOJIS=EMOJIS, language=language)
         dispatcher.utter_message(response="utter_invalid_option")
         dispatcher.utter_message(text=menu_data["text"], buttons=menu_data.get("buttons", []))
@@ -750,8 +758,171 @@ class ActionHandleMenuOption(Action):
             SlotSet("current_menu", "main"),
             SlotSet("current_submenu", None),
             SlotSet("menu_path_history", []),
-            SlotSet("awaiting_confirmation", False)
+            SlotSet("awaiting_confirmation", False),
+            SlotSet("awaiting_customer_number", False)
         ]
+
+
+
+# إعداد logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)  # لتتبع كل التفاصيل
+handler = logging.StreamHandler()
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+import random
+import requests
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from rasa_sdk import Action
+from rasa_sdk.events import SlotSet
+from rasa_sdk.executor import CollectingDispatcher
+from rasa_sdk import Tracker
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+import logging
+
+logger = logging.getLogger(__name__)
+
+class ActionRequestAccountStatementOTP(Action):
+    def name(self) -> str:
+        return "action_request_account_statement_otp"
+
+    def run(self, dispatcher: CollectingDispatcher,
+            tracker: Tracker,
+            domain: dict) -> list:
+
+        logger.debug("===== بدء تنفيذ ActionRequestAccountStatementOTP =====")
+        user_message = tracker.latest_message.get("text", "").strip()
+        logger.debug(f"رسالة المستخدم: {user_message}")
+
+        # ---------------- استخراج الكيانات ----------------
+        cus_num = None
+        nat_num = None
+        for ent in tracker.latest_message.get('entities', []):
+            if ent.get('entity') == 'customer_num':
+                cus_num = ent.get('value')
+            elif ent.get('entity') == 'customer_id':
+                nat_num = ent.get('value')
+
+        # ---------------- استخدام النص مباشرة إذا لم توجد كيانات ----------------
+        if not cus_num and not nat_num:
+            if user_message.isdigit() and 5 <= len(user_message) <= 20:
+                cus_num = user_message
+            else:
+                dispatcher.utter_message(text="⚠️ الرجاء إدخال رقم العميل أو رقم الهوية للمتابعة.")
+                return [SlotSet("awaiting_customer_number", True)]
+
+        # ---------------- اتصال قاعدة البيانات ----------------
+        try:
+            engine = create_engine(
+                "oracle+cx_oracle://TNB_CHATBOT:Abcd_5321@172.28.61.10:1898/?service_name=banks.world4",
+                echo=False
+            )
+            Session = sessionmaker(bind=engine)
+
+            with Session() as session:
+                sql = """
+                SELECT CUSTOMER.BRA_CODE,
+                       CUSTOMER.CUS_NUM,
+                       CUSTOMER.NAT_NUM,
+                       SUBSTR(CUST_PRO.TEL_NUM,5) AS TEL_NUM,
+                       adrs.EMAIL,
+                       CUST_PRO.IND_CORP_FLAG
+                  FROM BANKSYS.CUSTOMER CUSTOMER
+                  JOIN BANKSYS.CUST_PRO CUST_PRO
+                    ON CUSTOMER.BRA_CODE = CUST_PRO.BRA_CODE
+                   AND CUSTOMER.CUS_NUM = CUST_PRO.CUS_NUM
+                  JOIN BANKSYS.ADDRESS adrs
+                    ON adrs.BRA_CODE = CUST_PRO.BRA_CODE
+                   AND adrs.CUS_NUM = CUSTOMER.CUS_NUM
+                 WHERE CUST_PRO.IND_CORP_FLAG = 1
+                   AND adrs.LED_CODE = 0
+                   AND ((:cus_num IS NOT NULL AND CUSTOMER.CUS_NUM = :cus_num)
+                        OR (:nat_num IS NOT NULL AND CUSTOMER.NAT_NUM = :nat_num))
+                """
+
+                row = session.execute(text(sql), {"cus_num": cus_num, "nat_num": nat_num}).fetchone()
+                logger.debug(f"نتيجة الاستعلام: {row}")
+
+                if row:
+                    bra_code, c_num, n_num, tel, email, ind_corp = row
+                    ind_corp_label = "فردي" if ind_corp == 1 else "شركة"
+
+                    otp_code = str(random.randint(100000, 999999))
+                    logger.debug(f"تم توليد OTP: {otp_code}")
+
+                    if tel:
+                        # إرسال OTP عبر SMS
+                        api_url = "https://sms.tnbank.ps/BANKSSMS/otpservice"
+                        params = {
+                            "user": "USERNAME",        # ضع بيانات المستخدم هنا
+                            "password": "PASSWORD",    # ضع كلمة المرور هنا
+                            "mobiles": tel,
+                            "sms": f"رمز التحقق الخاص بك هو: {otp_code}",
+                            "senderid": "TNBANK"
+                        }
+                        try:
+                            response = requests.get(api_url, params=params, timeout=10, verify=False)
+                            if response.status_code == 200:
+                                dispatcher.utter_message(text="🔑 تم إرسال رمز التحقق OTP إلى رقم الهاتف المسجل لديك.")
+                                logger.debug(f"تم إرسال OTP إلى الهاتف: {tel}")
+                            else:
+                                dispatcher.utter_message(text="⚠️ لم نتمكن من إرسال OTP عبر الهاتف. سيتم المحاولة عبر البريد الإلكتروني.")
+                                logger.error(f"فشل إرسال OTP عبر الهاتف. Status code: {response.status_code}, Response: {response.text}")
+                                tel = None  # التبديل للإيميل
+                        except Exception as e:
+                            dispatcher.utter_message(text="⚠️ حدث خطأ أثناء محاولة إرسال OTP عبر الهاتف. سيتم المحاولة عبر البريد الإلكتروني.")
+                            logger.error(f"فشل إرسال OTP عبر الهاتف: {e}")
+                            tel = None  # التبديل للإيميل
+
+                    if not tel and email:
+                        # إرسال OTP عبر البريد الإلكتروني
+                        try:
+                            sender_email = "your_email@tnbank.ps"
+                            sender_password = "EMAIL_PASSWORD"
+                            msg = MIMEMultipart()
+                            msg['From'] = sender_email
+                            msg['To'] = email
+                            msg['Subject'] = "رمز التحقق OTP"
+                            msg.attach(MIMEText(f"رمز التحقق الخاص بك هو: {otp_code}", 'plain'))
+
+                            with smtplib.SMTP("smtp.tnbank.ps", 587) as server:
+                                server.starttls()
+                                server.login(sender_email, sender_password)
+                                server.send_message(msg)
+
+                            dispatcher.utter_message(text="🔑 تم إرسال رمز التحقق OTP إلى البريد الإلكتروني المسجل لديك.")
+                            logger.debug(f"تم إرسال OTP إلى البريد الإلكتروني: {email}")
+                        except Exception as e:
+                            dispatcher.utter_message(text="⚠️ لم نتمكن من إرسال OTP عبر البريد الإلكتروني. الرجاء المحاولة لاحقًا.")
+                            logger.error(f"فشل إرسال OTP عبر البريد الإلكتروني: {e}")
+
+                    return [SlotSet("awaiting_customer_number", False),
+                            SlotSet("account_statement_otp", otp_code)]
+                else:
+                    dispatcher.utter_message(text="❌ لم يتم العثور على بيانات بهذا الرقم.")
+                    return [SlotSet("awaiting_customer_number", False)]
+
+        except Exception as e:
+            dispatcher.utter_message(text=f"⚠️ خطأ في النظام: {str(e)}")
+            logger.error(f"Exception: {e}")
+            return [SlotSet("awaiting_customer_number", False)]
+
+
+
+
+
+
 
 
 class ActionBack(Action):
